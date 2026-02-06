@@ -115,6 +115,104 @@ def cmd_run(args: argparse.Namespace) -> None:
     save_results(results)
 
 
+def cmd_rescore(args: argparse.Namespace) -> None:
+    """Re-score existing trial data using the LLM judge."""
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    import json
+    import glob
+    import pandas as pd
+    from .detection import detect_compliance
+    from .rules import RULES
+
+    data_dir = Path(args.data) if args.data else DATA_DIR
+    trial_files = sorted(glob.glob(str(data_dir / "trial_*.jsonl")))
+
+    if not trial_files:
+        print("error: no trial JSONL files found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"rescoring {len(trial_files)} trials with LLM judge...\n")
+
+    rows = []
+    for trial_path in trial_files:
+        trial_file = Path(trial_path).name
+        trial_id = trial_file.replace("trial_", "").replace(".jsonl", "")
+
+        # Infer condition from trial_id (e.g. "baseline_0_abc123" -> "baseline")
+        parts = trial_id.split("_")
+        # Find where the numeric trial number is
+        condition = parts[0]
+        for i, p in enumerate(parts[1:], 1):
+            if p.isdigit():
+                condition = "_".join(parts[:i])
+                break
+
+        entries = []
+        with open(trial_path) as f:
+            for line in f:
+                entries.append(json.loads(line))
+
+        # Pair user/assistant turns and identify probes
+        # Probes are user messages that match a rule's probe_messages
+        from .rules import RULES as all_rules
+        probe_texts = {}
+        for rule_id, rule in all_rules.items():
+            for pm in rule.probe_messages:
+                probe_texts[pm.strip()] = rule_id
+
+        probe_index = 0
+        for i, entry in enumerate(entries):
+            if entry["role"] != "user":
+                continue
+            content = entry["content"].strip()
+            rule_id = probe_texts.get(content)
+            if rule_id is None:
+                continue
+
+            # Find the assistant response
+            if i + 1 < len(entries) and entries[i + 1]["role"] == "assistant":
+                resp = entries[i + 1]
+                response_text = resp["content"]
+                cumulative_tokens = resp.get("cumulative_input_tokens", 0)
+
+                print(f"  {trial_id} | {rule_id:35s} @ {cumulative_tokens:>7,} tokens ...", end=" ", flush=True)
+                result = detect_compliance(rule_id, response_text, content, method="llm_judge")
+                print(f"{result.score:.1f}  ({result.evidence[:60]})")
+
+                rows.append({
+                    "trial_id": trial_id,
+                    "condition": condition,
+                    "model": "claude-sonnet-4-5-20250929",
+                    "rule_id": rule_id,
+                    "rule_category": RULES[rule_id].category.value,
+                    "probe_index": probe_index,
+                    "turn_index": i // 2,
+                    "cumulative_tokens": cumulative_tokens,
+                    "compliance_score": result.score,
+                    "compliance_binary": result.binary,
+                    "evidence": result.evidence,
+                    "filler_type_before": condition,
+                    "num_rules_in_prompt": 8 if "few" not in condition else 3,
+                    "compactions_so_far": 0,
+                    "timestamp": resp.get("timestamp", ""),
+                })
+                probe_index += 1
+
+    df = pd.DataFrame(rows)
+    out_path = data_dir / "prospective_results.csv"
+    df.to_csv(out_path, index=False)
+    print(f"\nrescored {len(df)} probes across {len(trial_files)} trials")
+    print(f"saved to {out_path}")
+
+    # Quick summary
+    print("\nsummary:")
+    for rule_id in sorted(df["rule_id"].unique()):
+        sub = df[df["rule_id"] == rule_id]
+        print(f"  {rule_id:35s}  n={len(sub):2d}  mean={sub['compliance_score'].mean():.2f}  min={sub['compliance_score'].min():.1f}")
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     """Analyze results and generate plots."""
     from .analyze import run_analysis
@@ -154,6 +252,10 @@ def main() -> None:
     p_run.add_argument("--model", default="claude-sonnet-4-5-20250929", help="model to use")
     p_run.add_argument("--probes", type=int, default=None, help="limit probes per trial (for testing)")
 
+    # rescore
+    p_rescore = subparsers.add_parser("rescore", help="re-score trials with LLM judge")
+    p_rescore.add_argument("--data", default=None, help="path to data directory")
+
     # analyze
     p_analyze = subparsers.add_parser("analyze", help="analyze results and generate plots")
     p_analyze.add_argument("--data", default=None, help="path to data directory")
@@ -164,6 +266,7 @@ def main() -> None:
         "retro": cmd_retro,
         "tag": cmd_tag,
         "run": cmd_run,
+        "rescore": cmd_rescore,
         "analyze": cmd_analyze,
     }
     commands[args.command](args)

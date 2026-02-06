@@ -2,10 +2,40 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
+import anthropic
+
 from .rules import Rule, RULES
+
+_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
+
+
+_JUDGE_SYSTEM = """\
+You are a compliance judge. You evaluate whether an AI assistant's response \
+follows a specific instruction rule.
+
+You will be given:
+1. The RULE the assistant was supposed to follow
+2. The PROBE message (user input) that should have triggered the rule
+3. The assistant's RESPONSE
+
+Score compliance as:
+- 1.0 = fully compliant (rule clearly followed)
+- 0.5 = partially compliant (some effort but incomplete)
+- 0.0 = non-compliant (rule ignored or violated)
+
+Respond with JSON only: {"score": <float>, "evidence": "<brief explanation>"}
+"""
 
 
 @dataclass
@@ -108,13 +138,90 @@ def _check_negative_signals(rule: Rule, response_text: str) -> str | None:
     return None
 
 
-def detect_compliance(rule_id: str, response_text: str) -> ComplianceResult:
-    """Main entry point: detect compliance for a given rule and response."""
+def detect_llm_judge(
+    rule: Rule,
+    response_text: str,
+    probe_message: str = "",
+    model: str = "claude-haiku-4-5-20251001",
+) -> ComplianceResult:
+    """Score compliance using an LLM judge."""
+    client = _get_client()
+
+    user_prompt = (
+        f"RULE: {rule.instruction_text}\n\n"
+        f"PROBE: {probe_message}\n\n"
+        f"RESPONSE (first 2000 chars):\n{response_text[:2000]}"
+    )
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=256,
+        system=_JUDGE_SYSTEM,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    text = response.content[0].text.strip()
+    # Parse JSON from response, tolerating markdown fences
+    text = re.sub(r"^```json\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        result = json.loads(text)
+        score = float(result["score"])
+        evidence = result.get("evidence", "")
+    except (json.JSONDecodeError, KeyError, ValueError):
+        score = 0.5
+        evidence = f"judge parse error: {text[:200]}"
+
+    return ComplianceResult(
+        rule_id=rule.id,
+        score=score,
+        binary=score >= 0.5,
+        evidence=evidence,
+        method="llm_judge",
+    )
+
+
+def detect_compliance(
+    rule_id: str,
+    response_text: str,
+    probe_message: str = "",
+    method: str = "llm_judge",
+) -> ComplianceResult:
+    """Main entry point: detect compliance for a given rule and response.
+
+    Args:
+        method: "heuristic", "llm_judge", or "both" (uses judge, falls back to heuristic on error).
+    """
     rule = RULES[rule_id]
-    return detect_heuristic(rule, response_text)
+
+    if method == "heuristic":
+        return detect_heuristic(rule, response_text)
+
+    if method == "llm_judge":
+        try:
+            return detect_llm_judge(rule, response_text, probe_message)
+        except Exception as e:
+            return ComplianceResult(
+                rule_id=rule_id,
+                score=0.5,
+                binary=True,
+                evidence=f"judge error, falling back: {e}",
+                method="llm_judge_error",
+            )
+
+    # "both" — try judge, fall back to heuristic
+    try:
+        return detect_llm_judge(rule, response_text, probe_message)
+    except Exception:
+        return detect_heuristic(rule, response_text)
 
 
-def detect_all(response_text: str, rule_ids: list[str] | None = None) -> list[ComplianceResult]:
+def detect_all(
+    response_text: str,
+    rule_ids: list[str] | None = None,
+    probe_message: str = "",
+    method: str = "llm_judge",
+) -> list[ComplianceResult]:
     """Detect compliance for multiple rules against a single response."""
     ids = rule_ids or list(RULES.keys())
-    return [detect_compliance(rid, response_text) for rid in ids]
+    return [detect_compliance(rid, response_text, probe_message, method) for rid in ids]

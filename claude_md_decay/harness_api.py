@@ -125,7 +125,7 @@ class APIHarness:
     ) -> ProbeResult:
         """Send a probe message and score compliance."""
         response_text = self.send(probe_message)
-        compliance = detect_compliance(rule_id, response_text)
+        compliance = detect_compliance(rule_id, response_text, probe_message)
 
         return ProbeResult(
             rule_id=rule_id,
