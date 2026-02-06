@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.env
+claude_md_decay/data/*.jsonl
+claude_md_decay/data/*.csv
+claude_md_decay/data/plots/
+uv.lock

@@ -1,0 +1,173 @@
+"""CLI entry point: run/analyze/retro/tag subcommands."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .config import Condition, ExperimentConfig, DATA_DIR
+
+
+def cmd_retro(args: argparse.Namespace) -> None:
+    """Parse existing conversations and report activation opportunities."""
+    from .retrospective import parse_all_sessions, find_activation_opportunities, summarize_sessions
+
+    sessions_dir = Path(args.sessions_dir)
+    if not sessions_dir.exists():
+        print(f"error: directory not found: {sessions_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"parsing sessions from {sessions_dir}...")
+    sessions = parse_all_sessions(sessions_dir)
+
+    summary = summarize_sessions(sessions)
+    print(f"\nsessions:     {summary['sessions']}")
+    print(f"total turns:  {summary['total_turns']:,}")
+    print(f"compactions:  {summary['total_compactions']}")
+    print(f"sessions w/ compaction: {summary['sessions_with_compactions']}")
+    print(f"total size:   {summary['total_size_mb']} MB")
+
+    # Find activation opportunities
+    print("\nscanning for activation opportunities...")
+    all_opps = []
+    for session in sessions:
+        opps = find_activation_opportunities(session)
+        all_opps.extend(opps)
+
+    # Summarize by rule
+    from collections import Counter
+    by_rule = Counter(opp.rule_id for opp in all_opps)
+    print(f"\ntotal opportunities: {len(all_opps)}")
+    for rule_id, count in sorted(by_rule.items(), key=lambda x: -x[1]):
+        print(f"  {rule_id}: {count}")
+
+    # Save opportunities for tagging
+    import json
+    opps_path = DATA_DIR / "retrospective_opportunities.jsonl"
+    opps_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(opps_path, "w") as f:
+        for opp in all_opps:
+            f.write(json.dumps({
+                "session_id": opp.session_id,
+                "turn_index": opp.turn_index,
+                "cumulative_tokens": opp.cumulative_input_tokens,
+                "rule_id": opp.rule_id,
+                "context_snippet": opp.context_snippet,
+                "assistant_response": opp.assistant_response,
+                "compactions_before": opp.compactions_before,
+                "timestamp": opp.timestamp,
+            }) + "\n")
+    print(f"\nopportunities saved to {opps_path}")
+
+
+def cmd_tag(args: argparse.Namespace) -> None:
+    """Launch interactive tagging CLI."""
+    import json
+    from .retrospective import ActivationOpportunity
+    from .tagger import run_tagger
+
+    opps_path = DATA_DIR / "retrospective_opportunities.jsonl"
+    if not opps_path.exists():
+        print("error: no opportunities file found. run 'retro' first.", file=sys.stderr)
+        sys.exit(1)
+
+    opportunities = []
+    with open(opps_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            opportunities.append(ActivationOpportunity(
+                session_id=rec["session_id"],
+                turn_index=rec["turn_index"],
+                cumulative_input_tokens=rec["cumulative_tokens"],
+                rule_id=rec["rule_id"],
+                context_snippet=rec["context_snippet"],
+                assistant_response=rec["assistant_response"],
+                compactions_before=rec["compactions_before"],
+                timestamp=rec["timestamp"],
+            ))
+
+    run_tagger(opportunities)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Run prospective experiment trials."""
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    from .runner import run_experiment, save_results
+
+    conditions = [Condition(c) for c in args.condition]
+    config = ExperimentConfig(
+        conditions=conditions,
+        replications=args.trials,
+        model=args.model,
+        num_probes=args.probes if args.probes else None,
+    )
+
+    print(f"running experiment: conditions={[c.value for c in conditions]}, "
+          f"trials={args.trials}, model={args.model}")
+
+    results = run_experiment(config)
+    save_results(results)
+
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    """Analyze results and generate plots."""
+    from .analyze import run_analysis
+
+    data_dir = Path(args.data) if args.data else DATA_DIR
+    run_analysis(data_dir)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="claude_md_decay",
+        description="CLAUDE.md instruction decay experiment",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # retro
+    p_retro = subparsers.add_parser("retro", help="parse existing conversations")
+    p_retro.add_argument(
+        "--sessions-dir",
+        required=True,
+        help="path to directory containing .jsonl session files",
+    )
+
+    # tag
+    p_tag = subparsers.add_parser("tag", help="interactive compliance tagging")
+
+    # run
+    p_run = subparsers.add_parser("run", help="run prospective experiment trials")
+    p_run.add_argument(
+        "--condition",
+        nargs="+",
+        default=["baseline"],
+        choices=[c.value for c in Condition],
+        help="experiment conditions to run",
+    )
+    p_run.add_argument("--trials", type=int, default=3, help="replications per condition")
+    p_run.add_argument("--model", default="claude-sonnet-4-5-20250929", help="model to use")
+    p_run.add_argument("--probes", type=int, default=None, help="limit probes per trial (for testing)")
+
+    # analyze
+    p_analyze = subparsers.add_parser("analyze", help="analyze results and generate plots")
+    p_analyze.add_argument("--data", default=None, help="path to data directory")
+
+    args = parser.parse_args()
+
+    commands = {
+        "retro": cmd_retro,
+        "tag": cmd_tag,
+        "run": cmd_run,
+        "analyze": cmd_analyze,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

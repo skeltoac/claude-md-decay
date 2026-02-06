@@ -1,0 +1,16 @@
+[project]
+name = "claude-md-decay"
+version = "0.1.0"
+description = "Quantifying CLAUDE.md instruction decay over long conversations"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.51.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.8.0",
+    "scipy>=1.12.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
