@@ -116,7 +116,12 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_rescore(args: argparse.Namespace) -> None:
-    """Re-score existing trial data using the LLM judge."""
+    """Re-score existing trial data using the LLM judge.
+
+    Walks every assistant response in every trial:
+    - "every response" rules (pineapple, noir) are checked on ALL turns
+    - Conditional rules are checked only when the user message triggers them
+    """
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -133,16 +138,26 @@ def cmd_rescore(args: argparse.Namespace) -> None:
         print("error: no trial JSONL files found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"rescoring {len(trial_files)} trials with LLM judge...\n")
+    # Rules that apply to every single response
+    EVERY_RESPONSE_RULES = {"pineapple_canary", "noir_monologue"}
+
+    # Build lookup for conditional probe triggers
+    probe_triggers: dict[str, str] = {}  # message text -> rule_id
+    for rule_id, rule in RULES.items():
+        if rule_id in EVERY_RESPONSE_RULES:
+            continue
+        for pm in rule.probe_messages:
+            probe_triggers[pm.strip()] = rule_id
+
+    print(f"rescoring {len(trial_files)} trials — every turn, every applicable rule\n")
 
     rows = []
     for trial_path in trial_files:
         trial_file = Path(trial_path).name
         trial_id = trial_file.replace("trial_", "").replace(".jsonl", "")
 
-        # Infer condition from trial_id (e.g. "baseline_0_abc123" -> "baseline")
+        # Infer condition
         parts = trial_id.split("_")
-        # Find where the numeric trial number is
         condition = parts[0]
         for i, p in enumerate(parts[1:], 1):
             if p.isdigit():
@@ -154,32 +169,51 @@ def cmd_rescore(args: argparse.Namespace) -> None:
             for line in f:
                 entries.append(json.loads(line))
 
-        # Pair user/assistant turns and identify probes
-        # Probes are user messages that match a rule's probe_messages
-        from .rules import RULES as all_rules
-        probe_texts = {}
-        for rule_id, rule in all_rules.items():
-            for pm in rule.probe_messages:
-                probe_texts[pm.strip()] = rule_id
+        # Figure out which rules are in this trial's system prompt
+        trial_rules = set(RULES.keys())
+        if "few" in condition:
+            from .rules import FEW_RULES
+            trial_rules = set(FEW_RULES)
 
-        probe_index = 0
+        # Which every-response rules are active in this trial?
+        active_every_response = EVERY_RESPONSE_RULES & trial_rules
+
+        print(f"  {trial_id} ({len(entries)} entries, rules: {len(trial_rules)})")
+
+        # Walk user/assistant pairs
+        turn_num = 0
         for i, entry in enumerate(entries):
             if entry["role"] != "user":
                 continue
-            content = entry["content"].strip()
-            rule_id = probe_texts.get(content)
-            if rule_id is None:
+            # Find paired assistant response
+            if i + 1 >= len(entries) or entries[i + 1]["role"] != "assistant":
                 continue
 
-            # Find the assistant response
-            if i + 1 < len(entries) and entries[i + 1]["role"] == "assistant":
-                resp = entries[i + 1]
-                response_text = resp["content"]
-                cumulative_tokens = resp.get("cumulative_input_tokens", 0)
+            user_text = entry["content"].strip()
+            resp = entries[i + 1]
+            response_text = resp["content"]
+            cumulative_tokens = resp.get("cumulative_input_tokens", 0)
+            timestamp = resp.get("timestamp", "")
+            turn_num += 1
 
-                print(f"  {trial_id} | {rule_id:35s} @ {cumulative_tokens:>7,} tokens ...", end=" ", flush=True)
-                result = detect_compliance(rule_id, response_text, content, method="llm_judge")
-                print(f"{result.score:.1f}  ({result.evidence[:60]})")
+            # Collect all rules to check for this turn
+            rules_to_check: list[tuple[str, str]] = []  # (rule_id, trigger_type)
+
+            # Every-response rules always apply
+            for rule_id in sorted(active_every_response):
+                rules_to_check.append((rule_id, "every_response"))
+
+            # Conditional rules only when probe matches
+            triggered_rule = probe_triggers.get(user_text)
+            if triggered_rule and triggered_rule in trial_rules:
+                rules_to_check.append((triggered_rule, "probe"))
+
+            # Score each applicable rule
+            for rule_id, trigger_type in rules_to_check:
+                result = detect_compliance(rule_id, response_text, user_text, method="llm_judge")
+                tag = "P" if trigger_type == "probe" else "E"
+                status = "ok" if result.score >= 0.8 else "FAIL" if result.score <= 0.2 else "partial"
+                print(f"    [{tag}] turn {turn_num:2d} | {rule_id:30s} @ {cumulative_tokens:>7,}t  {result.score:.1f} {status}")
 
                 rows.append({
                     "trial_id": trial_id,
@@ -187,30 +221,31 @@ def cmd_rescore(args: argparse.Namespace) -> None:
                     "model": "claude-sonnet-4-5-20250929",
                     "rule_id": rule_id,
                     "rule_category": RULES[rule_id].category.value,
-                    "probe_index": probe_index,
-                    "turn_index": i // 2,
+                    "probe_index": turn_num,
+                    "turn_index": turn_num,
                     "cumulative_tokens": cumulative_tokens,
                     "compliance_score": result.score,
                     "compliance_binary": result.binary,
                     "evidence": result.evidence,
-                    "filler_type_before": condition,
-                    "num_rules_in_prompt": 8 if "few" not in condition else 3,
+                    "filler_type_before": trigger_type,
+                    "num_rules_in_prompt": len(trial_rules),
                     "compactions_so_far": 0,
-                    "timestamp": resp.get("timestamp", ""),
+                    "timestamp": timestamp,
                 })
-                probe_index += 1
+
+        print()
 
     df = pd.DataFrame(rows)
     out_path = data_dir / "prospective_results.csv"
     df.to_csv(out_path, index=False)
-    print(f"\nrescored {len(df)} probes across {len(trial_files)} trials")
+    print(f"rescored {len(df)} judgments across {len(trial_files)} trials")
     print(f"saved to {out_path}")
 
-    # Quick summary
+    # Summary
     print("\nsummary:")
     for rule_id in sorted(df["rule_id"].unique()):
         sub = df[df["rule_id"] == rule_id]
-        print(f"  {rule_id:35s}  n={len(sub):2d}  mean={sub['compliance_score'].mean():.2f}  min={sub['compliance_score'].min():.1f}")
+        print(f"  {rule_id:35s}  n={len(sub):3d}  mean={sub['compliance_score'].mean():.2f}  min={sub['compliance_score'].min():.1f}")
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
