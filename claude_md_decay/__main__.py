@@ -128,7 +128,7 @@ def cmd_rescore(args: argparse.Namespace) -> None:
     import json
     import glob
     import pandas as pd
-    from .detection import detect_compliance
+    from .detection import detect_compliance, init_judge_log, close_judge_log
     from .rules import RULES
 
     data_dir = Path(args.data) if args.data else DATA_DIR
@@ -137,6 +137,9 @@ def cmd_rescore(args: argparse.Namespace) -> None:
     if not trial_files:
         print("error: no trial JSONL files found", file=sys.stderr)
         sys.exit(1)
+
+    log_path = init_judge_log(data_dir / "judge_log.jsonl")
+    print(f"judge interactions will be logged to {log_path}")
 
     # Rules that apply to every single response
     EVERY_RESPONSE_RULES = {"pineapple_canary", "noir_monologue"}
@@ -235,11 +238,14 @@ def cmd_rescore(args: argparse.Namespace) -> None:
 
         print()
 
+    close_judge_log()
+
     df = pd.DataFrame(rows)
     out_path = data_dir / "prospective_results.csv"
     df.to_csv(out_path, index=False)
-    print(f"rescored {len(df)} judgments across {len(trial_files)} trials")
-    print(f"saved to {out_path}")
+    print(f"\nrescored {len(df)} judgments across {len(trial_files)} trials")
+    print(f"results: {out_path}")
+    print(f"judge log: {data_dir / 'judge_log.jsonl'}")
 
     # Summary
     print("\nsummary:")

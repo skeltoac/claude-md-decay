@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import anthropic
 
+from .config import DATA_DIR
 from .rules import Rule, RULES
 
 _client: anthropic.Anthropic | None = None
+_judge_log_path: Path | None = None
+_judge_log_file = None
 
 
 def _get_client() -> anthropic.Anthropic:
@@ -18,6 +23,50 @@ def _get_client() -> anthropic.Anthropic:
     if _client is None:
         _client = anthropic.Anthropic()
     return _client
+
+
+def init_judge_log(path: Path | None = None) -> Path:
+    """Initialize the judge interaction log. Call before rescoring."""
+    global _judge_log_path, _judge_log_file
+    _judge_log_path = path or DATA_DIR / "judge_log.jsonl"
+    _judge_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _judge_log_file = open(_judge_log_path, "w")
+    return _judge_log_path
+
+
+def close_judge_log() -> None:
+    global _judge_log_file
+    if _judge_log_file:
+        _judge_log_file.close()
+        _judge_log_file = None
+
+
+def _log_judge_interaction(
+    rule_id: str,
+    rule_text: str,
+    probe_message: str,
+    response_excerpt: str,
+    judge_raw_output: str,
+    parsed_score: float,
+    parsed_evidence: str,
+    parse_ok: bool,
+) -> None:
+    """Append a judge interaction record to the log."""
+    if not _judge_log_file:
+        return
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rule_id": rule_id,
+        "rule_text": rule_text,
+        "probe_message": probe_message[:500],
+        "response_excerpt": response_excerpt[:2000],
+        "judge_raw_output": judge_raw_output,
+        "parsed_score": parsed_score,
+        "parsed_evidence": parsed_evidence,
+        "parse_ok": parse_ok,
+    }
+    _judge_log_file.write(json.dumps(record) + "\n")
+    _judge_log_file.flush()
 
 
 _JUDGE_SYSTEM = """\
@@ -160,17 +209,30 @@ def detect_llm_judge(
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    text = response.content[0].text.strip()
+    raw_output = response.content[0].text.strip()
     # Parse JSON from response, tolerating markdown fences
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    cleaned = re.sub(r"^```json\s*", "", raw_output)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    parse_ok = True
     try:
-        result = json.loads(text)
+        result = json.loads(cleaned)
         score = float(result["score"])
         evidence = result.get("evidence", "")
     except (json.JSONDecodeError, KeyError, ValueError):
         score = 0.5
-        evidence = f"judge parse error: {text[:200]}"
+        evidence = f"judge parse error: {raw_output[:200]}"
+        parse_ok = False
+
+    _log_judge_interaction(
+        rule_id=rule.id,
+        rule_text=rule.instruction_text,
+        probe_message=probe_message,
+        response_excerpt=response_text[:2000],
+        judge_raw_output=raw_output,
+        parsed_score=score,
+        parsed_evidence=evidence,
+        parse_ok=parse_ok,
+    )
 
     return ComplianceResult(
         rule_id=rule.id,
